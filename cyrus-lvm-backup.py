@@ -6,11 +6,14 @@
 #
 
 import click
-import requests
+import os
 from pathlib import Path
 from pystemd.systemd1 import Unit
-from subprocess import run, check_output, PIPE, CompletedProcess
+import requests
+from subprocess import run, check_output, PIPE, STDOUT, DEVNULL, CompletedProcess
 from syslog import openlog, syslog, LOG_ERR, LOG_MAIL
+import time
+import yaml
 
 class LocalError(RuntimeError):
     pass
@@ -22,17 +25,18 @@ PUSHOVER_USER_KEY = None
 @click.option('--lv-name', help='Name of logical volume to snapshot', required=True)
 @click.option('--vg-name', help='Name of containing volume group', required=True)
 @click.option('--rsync-host', '-h', help='rsync target host name', required=True)
-@click.option('--rsync-path', '-p', help='rsync target path', required=True)
 @click.option('--pushover-yaml', help='Pushover file containing TOKEN and USER_KEY for alerting')
 @click.option('--force/--no-force', default=False,
               help='Forcibly remove existing LVM2 snapshot and/or mountpoint')
-def main(lv_name, vg_name, rsync_host, rsync_path, pushover_yaml, force):
+def main(lv_name, vg_name, rsync_host, pushover_yaml, force):
     try:
         cyrus = None
         mount_point = f'/mnt/{lv_name}_bkup'
         backup_vol = f'{lv_name}_bkup'
-        lv_full_name = f'{lv_name}/{vg_name}'
-        validate(lv_full_name, force, mount_point, pushover_yaml)
+        lv_full_name = f'{vg_name}/{lv_name}'
+        bkup_lv_full_name = f'{vg_name}/{backup_vol}'
+        validate(lv_name=lv_full_name, bkup_lv_name=bkup_lv_full_name, force=force,
+                 mount_point=mount_point, pushover_yaml=pushover_yaml)
 
         # stop cyrus-imapd
         cyrus = Unit(b'cyrus-imapd.service')
@@ -44,7 +48,7 @@ def main(lv_name, vg_name, rsync_host, rsync_path, pushover_yaml, force):
 
         # make snapshot
         proc = run(f'lvcreate --snapshot --name {backup_vol} --size 100M /dev/{lv_full_name}'.split(),
-                   capture_output, text=True)
+                   capture_output=True, text=True)
         check_proc(proc, 'Failed to create snapshot')
 
         # restart cyrus-imapd
@@ -56,9 +60,10 @@ def main(lv_name, vg_name, rsync_host, rsync_path, pushover_yaml, force):
         check_proc(proc, 'Failed to mount snapshot')
 
         # rsync to backup host
-        rsync_cmd = 'rsync --archive --relative --sparse --hard-links --one-file-system --delete '
-        f'--numeric-ids --rsh=ssh --fake-super --numeric-ids {mount_point} {rsync_host}:{lv_name}'
-        proc = run(rsync_cmd.split(), stdout=None, stderr=PIPE, text=True)
+        rsync_cmd = ('rsync --archive --relative --sparse --hard-links --one-file-system --delete '
+                     f'--numeric-ids --rsh=ssh --fake-super --numeric-ids {mount_point} '
+                     f'{rsync_host}:{lv_name}')
+        proc = run(rsync_cmd.split(), stdout=DEVNULL, stderr=PIPE, text=True)
         check_proc(proc, 'Failed to rsync to backup host')
 
         # unmount & remove snapshot
@@ -77,7 +82,7 @@ def main(lv_name, vg_name, rsync_host, rsync_path, pushover_yaml, force):
         notify(pushover_yaml is not None, 'Successfully backed up cyrus volume')
 
     except Exception as exc:
-        notify(pushvoer_yaml is not None, repr(exc))
+        notify(pushover_yaml is not None, repr(exc))
         raise exc
 
     finally:
@@ -88,7 +93,8 @@ def main(lv_name, vg_name, rsync_host, rsync_path, pushover_yaml, force):
 
 def check_proc(proc: CompletedProcess, err_msg: str):
     if proc.returncode == 0:
-        print(proc.stdout)
+        if proc.stdout and proc.stdout.strip():
+            print(proc.stdout.strip())
     else:
         raise LocalError(f'{err_msg}: {proc.stderr}')
 
@@ -106,15 +112,15 @@ def notify(pushover: bool, msg: str) -> None:
         syslog(LOG_ERR, 'msg')
 
 
-def validate(volume_name: str, force: bool, mount_point: str, pushover_yaml: str):
+def validate(lv_name=None, bkup_lv_name=None, force=False, mount_point=None, pushover_yaml=None):
     """
     Check that utilities exist, etc...
     Also, makes sure the mountpoint exists
     """
-    proc = run('lvs --options lv_full_name --noheadings'.split(), check=True, stdout=PIPE,
-               stderr=None, text=True).output.strip())
-    if volume_name not in proc.stdout:
-        raise LocalError(f'LVM volume {volume_name} not found')
+    out = run('lvs --options lv_full_name --noheadings'.split(), check=True, stdout=PIPE,
+              stderr=None, text=True).stdout.strip()
+    if lv_name not in out:
+        raise LocalError(f'LVM volume {lv_name} not found')
 
     tests = (('rsync --version', 'protocol version'),
              ('lvcreate --version', 'LVM version'),
@@ -130,8 +136,8 @@ def validate(volume_name: str, force: bool, mount_point: str, pushover_yaml: str
 
     if os.path.exists(mount_point):
         if force:
-            mounted = check_output(['mount'])
-            if f'on {mount_path} ' in mounted:
+            mounted = check_output(['mount'], text=True)
+            if f'on {mount_point} ' in mounted:
                 proc = run(f'umount {mount_point}'.split(), capture_output=True, text=True)
                 if proc.returncode != 0:
                     if proc.stderr:
@@ -139,7 +145,7 @@ def validate(volume_name: str, force: bool, mount_point: str, pushover_yaml: str
                     else:
                         raise LocalError(f'umount exited {proc.returncode}')
                 mounted = check_output(['mount'], text=True)
-                if f'on {mount_path} ' in mounted:
+                if f'on {mount_point} ' in mounted:
                     raise LocalError(f'Unable to unmount {mount_point}')
         else:
             raise LocalError(f'mount point {mount_point} exists')
@@ -151,11 +157,21 @@ def validate(volume_name: str, force: bool, mount_point: str, pushover_yaml: str
             else:
                 raise LocalError(f'mkdir failed (exited {proc.returncode})')
 
+    out = run('lvs --options lv_full_name --noheadings'.split(), check=True, stdout=PIPE,
+              stderr=None, text=True).stdout.strip()
+    if bkup_lv_name in out:
+        if force:
+            proc = run(f'lvremove --yes /dev/{bkup_lv_name}'.split())
+            check_proc(proc, 'Failed to remove logical volume {bkup_lv_name}')
+        else:
+            raise LocalError(f'Backup LV present ({bkup_lv_name})')
+
+
     if pushover_yaml:
         pushover_yaml = Path(pushover_yaml)
         if not pushover_yaml.exists():
             raise LocalError(f'Pushover YAML file {pushover_yaml} does not exist')
-        pushover_data = yaml.load(pushover_yaml.open())
+        pushover_data = yaml.safe_load(pushover_yaml.open())
         if not 'user_key' in pushover_data \
            and 'MailBackup' in pushover_data \
            and 'token' in pushover_data['MailBackup']:
