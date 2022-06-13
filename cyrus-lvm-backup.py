@@ -67,17 +67,22 @@ def main(lv_name, vg_name, rsync_host, pushover_yaml, force):
         check_proc(proc, 'Failed to rsync to backup host')
 
         # unmount & remove snapshot
-        proc = run(f'umount {mount_point}'.split())
+        proc = run(f'umount {mount_point}'.split(), text=True, capture_output=True)
         check_proc(proc, f'Failed to unmount {mount_point}')
-        proc = run(f'lvremove --yes /dev/{vg_name}/{backup_vol}'.split())
+        proc = run(f'lvremove --yes /dev/{vg_name}/{backup_vol}'.split(), capture_output=True,
+                   text=True)
         check_proc(proc, 'Failed to remove logical volume {vg_name}/{backup_vol}')
-        proc = run(f'rmdir {mount_point}'.split())
+        proc = run(f'rmdir {mount_point}'.split(), stdout=DEVNULL, stderr=PIPE, text=True)
         check_proc(proc, f'Failed to remove mountpoint directory {mount_point}')
 
         # Verify cyrus is running
         if not (cyrus.ActiveState == b'active' and cyrus.SubState == b'running'):
             raise LocalError('cyrus-imapd may be down after backup: ActiveState '
                              f'{cyrus.ActiveState} SubState{cyrus.SubState}')
+
+        proc = run(f'postqueue -f'.split(), stdout=PIPE, stderr=STDOUT, text=True)
+        if proc.returncode != 0:
+            notify(pushover_yaml is not None, f'Failed to flush postfix queue: {proc.stdout}')
 
         notify(pushover_yaml is not None, 'Successfully backed up cyrus volume')
 
@@ -126,8 +131,8 @@ def validate(lv_name=None, bkup_lv_name=None, force=False, mount_point=None, pus
              ('lvcreate --version', 'LVM version'),
              ('lvremove --version', 'LVM version'),
              ('mount --version', 'mount from util-linux'),
-             ('umount --version', 'umount from util-linux'))
-
+             ('umount --version', 'umount from util-linux'),
+             ('postqueue -p', ''))
 
     for (cmd, output) in tests:
         proc = run(cmd.split(), check=True, capture_output=True, text=True)
