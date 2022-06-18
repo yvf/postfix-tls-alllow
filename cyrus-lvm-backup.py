@@ -29,6 +29,20 @@ PUSHOVER_USER_KEY = None
 @click.option('--force/--no-force', default=False,
               help='Forcibly remove existing LVM2 snapshot and/or mountpoint')
 def main(lv_name, vg_name, rsync_host, pushover_yaml, force):
+    if pushover_yaml:
+        pushover_yaml = Path(pushover_yaml)
+        if not pushover_yaml.exists():
+            raise LocalError(f'Pushover YAML file {pushover_yaml} does not exist')
+        pushover_data = yaml.safe_load(pushover_yaml.open())
+        if not 'user_key' in pushover_data \
+           and 'MailBackup' in pushover_data \
+           and 'token' in pushover_data['MailBackup']:
+            raise LocalError('Structure of YAML pushover file incorrect')
+
+        global PUSHOVER_USER_KEY, PUSHOVER_TOKEN
+        PUSHOVER_USER_KEY = pushover_data['user_key']
+        PUSHOVER_TOKEN = pushover_data['MailBackup']['token']
+
     try:
         cyrus = None
         mount_point = f'/mnt/{lv_name}_bkup'
@@ -111,10 +125,11 @@ def notify(pushover: bool, msg: str) -> None:
                  "message" : msg  }
         resp = requests.post('https://api.pushover.net/1/messages.json', data=data)
         if resp.status_code != 200:
-            raise LocalError('Unable to send pushover notification: HTTP {resp.status_code}')
-    else:
-        openlog(facility=LOG_MAIL)
-        syslog(LOG_ERR, 'msg')
+            raise LocalError(f'Unable to send pushover notification: HTTP {resp.status_code}')
+
+    # Log to syslog also
+    openlog(facility=LOG_MAIL)
+    syslog(LOG_ERR, msg)
 
 
 def validate(lv_name=None, bkup_lv_name=None, force=False, mount_point=None, pushover_yaml=None):
@@ -170,21 +185,6 @@ def validate(lv_name=None, bkup_lv_name=None, force=False, mount_point=None, pus
             check_proc(proc, 'Failed to remove logical volume {bkup_lv_name}')
         else:
             raise LocalError(f'Backup LV present ({bkup_lv_name})')
-
-
-    if pushover_yaml:
-        pushover_yaml = Path(pushover_yaml)
-        if not pushover_yaml.exists():
-            raise LocalError(f'Pushover YAML file {pushover_yaml} does not exist')
-        pushover_data = yaml.safe_load(pushover_yaml.open())
-        if not 'user_key' in pushover_data \
-           and 'MailBackup' in pushover_data \
-           and 'token' in pushover_data['MailBackup']:
-            raise LocalError('Structure of YAML pushover file incorrect')
-
-        global PUSHOVER_USER_KEY, PUSHOVER_TOKEN
-        PUSHOVER_USER_KEY = pushover_data['user_key']
-        PUSHOVER_TOKEN = pushover_data['MailBackup']['token']
 
 if __name__ == '__main__':
     main()
